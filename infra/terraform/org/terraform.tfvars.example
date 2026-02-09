@@ -1,0 +1,29 @@
+enable_account_vending = false
+
+accounts = {
+  security = {
+    name  = "hawser-security"
+    email = "hawa.dizeyi+security@gmail.com"
+    ou    = "Security"
+  }
+  logging = {
+    name  = "hawser-logging"
+    email = "hawa.dizeyi+logging@gmail.com"
+    ou    = "Security"
+  }
+  shared = {
+    name  = "hawser-shared-services"
+    email = "hawa.dizeyi+shared@gmail.com"
+    ou    = "SharedServices"
+  }
+  dev = {
+    name  = "hawser-dev"
+    email = "hawa.dizeyi+dev@gmail.com"
+    ou    = "Workloads"
+  }
+  prod = {
+    name  = "hawser-prod"
+    email = "hawa.dizeyi+prod@gmail.com"
+    ou    = "Workloads"
+  }
+}
