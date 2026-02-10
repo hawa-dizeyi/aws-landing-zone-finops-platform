@@ -1,0 +1,9 @@
+aws_region = "eu-west-1"
+
+logging_account_id  = "299113402596"
+security_account_id = "778011348052"
+
+central_log_bucket_name = "hawser-o-ok6g3mlfr2-central-logs"
+cloudtrail_trail_name   = "org-trail"
+
+enable_securityhub_standards = true
