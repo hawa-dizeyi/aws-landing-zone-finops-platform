@@ -1,6 +1,9 @@
 data "aws_caller_identity" "mgmt" {}
-
 data "aws_organizations_organization" "org" {}
+
+locals {
+  cur_replication_role_arn = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:role/${var.cur_replication_role_name}"
+}
 
 ############################################
 # Central logging bucket + KMS (Logging Acct)
@@ -15,7 +18,6 @@ resource "aws_kms_key" "log_bucket" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      # Full control for logging account root
       {
         Sid       = "AllowLoggingAccountAdmin"
         Effect    = "Allow"
@@ -23,8 +25,6 @@ resource "aws_kms_key" "log_bucket" {
         Action    = "kms:*"
         Resource  = "*"
       },
-
-      # Allow CloudTrail service to use the key when writing to S3
       {
         Sid       = "AllowCloudTrailEncrypt"
         Effect    = "Allow"
@@ -40,6 +40,19 @@ resource "aws_kms_key" "log_bucket" {
             "aws:SourceAccount" = data.aws_caller_identity.mgmt.account_id
           }
         }
+      },
+      {
+        Sid       = "AllowCURReplicationRoleKMS"
+        Effect    = "Allow"
+        Principal = { AWS = local.cur_replication_role_arn }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
       }
     ]
   })
@@ -54,6 +67,16 @@ resource "aws_kms_alias" "log_bucket" {
 resource "aws_s3_bucket" "central_logs" {
   provider = aws.logging
   bucket   = var.central_log_bucket_name
+}
+
+# ✅ Key change: enforce destination bucket ownership so replication doesn't need ACL translation
+resource "aws_s3_bucket_ownership_controls" "central_logs" {
+  provider = aws.logging
+  bucket   = aws_s3_bucket.central_logs.id
+
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
 }
 
 resource "aws_s3_bucket_public_access_block" "central_logs" {
@@ -105,7 +128,6 @@ resource "aws_s3_bucket_lifecycle_configuration" "central_logs" {
   }
 }
 
-# Bucket policy: allow CloudTrail to write mgmt + org logs
 resource "aws_s3_bucket_policy" "central_logs" {
   provider = aws.logging
   bucket   = aws_s3_bucket.central_logs.id
@@ -113,6 +135,7 @@ resource "aws_s3_bucket_policy" "central_logs" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      # CloudTrail ACL check
       {
         Sid       = "AWSCloudTrailAclCheck"
         Effect    = "Allow"
@@ -128,6 +151,7 @@ resource "aws_s3_bucket_policy" "central_logs" {
           }
         }
       },
+      # CloudTrail write (mgmt)
       {
         Sid       = "AWSCloudTrailWriteMgmt"
         Effect    = "Allow"
@@ -144,6 +168,7 @@ resource "aws_s3_bucket_policy" "central_logs" {
           }
         }
       },
+      # CloudTrail write (org)
       {
         Sid       = "AWSCloudTrailWriteOrg"
         Effect    = "Allow"
@@ -159,9 +184,50 @@ resource "aws_s3_bucket_policy" "central_logs" {
             "aws:SourceArn" = "arn:aws:cloudtrail:${var.aws_region}:${data.aws_caller_identity.mgmt.account_id}:trail/${var.cloudtrail_trail_name}"
           }
         }
+      },
+      # Replication role can write replicas under cur prefix
+      {
+        Sid       = "AllowCURReplicationRoleWrite"
+        Effect    = "Allow"
+        Principal = { AWS = local.cur_replication_role_arn }
+        Action = [
+          "s3:ReplicateObject",
+          "s3:ReplicateDelete",
+          "s3:ReplicateTags",
+          "s3:ObjectOwnerOverrideToBucketOwner"
+        ]
+        Resource = "${aws_s3_bucket.central_logs.arn}/${var.cur_s3_prefix}/*"
+      },
+      # Allow mgmt FinOps user to list/read ONLY the CUR prefix (for verification)
+      {
+        Sid       = "AllowOrgFinopsListCurPrefix"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:user/org-finops" }
+        Action    = "s3:ListBucket"
+        Resource  = aws_s3_bucket.central_logs.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = [
+              "${var.cur_s3_prefix}/*",
+              "${var.cur_s3_prefix}/"
+            ]
+          }
+        }
+      },
+      {
+        Sid       = "AllowOrgFinopsReadCurObjects"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:user/org-finops" }
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion"
+        ]
+        Resource = "${aws_s3_bucket.central_logs.arn}/${var.cur_s3_prefix}/*"
       }
     ]
   })
+
+  depends_on = [aws_s3_bucket_ownership_controls.central_logs]
 }
 
 ############################################
@@ -185,7 +251,6 @@ resource "aws_cloudtrail" "org_trail" {
 # GuardDuty org delegated admin (Security Acct)
 ############################################
 
-# Set delegated admin from management account
 resource "aws_guardduty_organization_admin_account" "admin" {
   admin_account_id = var.security_account_id
 }
@@ -195,14 +260,12 @@ resource "time_sleep" "after_guardduty_admin" {
   create_duration = "30s"
 }
 
-# Create detector in security account (delegated admin)
 resource "aws_guardduty_detector" "security" {
   provider   = aws.security
   enable     = true
   depends_on = [time_sleep.after_guardduty_admin]
 }
 
-# Org auto-enable in security account
 resource "aws_guardduty_organization_configuration" "org" {
   provider    = aws.security
   detector_id = aws_guardduty_detector.security.id
@@ -222,11 +285,8 @@ resource "aws_securityhub_organization_admin_account" "admin" {
   admin_account_id = var.security_account_id
 }
 
-# NOTE:
-# If Security Hub is already enabled in the security account, import it:
-# terraform import -provider=aws.security aws_securityhub_account.security <SECURITY_ACCOUNT_ID>
 resource "aws_securityhub_account" "security" {
-  provider = aws.security
+  provider                 = aws.security
   enable_default_standards = false
 
   lifecycle {
@@ -241,7 +301,6 @@ resource "aws_securityhub_organization_configuration" "org" {
   depends_on = [aws_securityhub_account.security]
 }
 
-# Standards
 resource "aws_securityhub_standards_subscription" "aws_foundational" {
   provider      = aws.security
   count         = var.enable_securityhub_standards ? 1 : 0

@@ -7,3 +7,7 @@ central_log_bucket_name = "hawser-o-ok6g3mlfr2-central-logs"
 cloudtrail_trail_name   = "org-trail"
 
 enable_securityhub_standards = true
+
+cur_s3_prefix = "cur"
+
+cur_replication_role_arn = "arn:aws:iam::271758791335:role/cur-replication-role"

@@ -1,0 +1,19 @@
+aws_region = "eu-west-1"
+
+central_log_bucket_name = "hawser-o-ok6g3mlfr2-central-logs"
+central_log_kms_key_arn = "arn:aws:kms:eu-west-1:299113402596:key/73f05843-49fa-4849-a497-c6c466df4390"
+logging_account_id      = "299113402596"
+
+cur_delivery_bucket_name = "hawser-o-ok6g3mlfr2-cur-delivery"
+
+cur_report_name = "org-cur"
+cur_s3_prefix   = "cur"
+
+athena_results_prefix = "athena-results"
+
+glue_database_name    = "cur_db"
+athena_workgroup_name = "finops"
+
+replication_role_name = "cur-replication-role"
+
+enable_replication = true
