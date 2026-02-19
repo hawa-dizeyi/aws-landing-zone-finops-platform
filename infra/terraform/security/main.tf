@@ -3,11 +3,9 @@ data "aws_organizations_organization" "org" {}
 
 locals {
   cur_replication_role_arn = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:role/${var.cur_replication_role_name}"
+  org_finops_user_arn      = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:user/org-finops"
+  glue_crawler_role_arn    = "arn:aws:iam::271758791335:role/glue-cur-crawler-role"
 }
-
-############################################
-# Central logging bucket + KMS (Logging Acct)
-############################################
 
 resource "aws_kms_key" "log_bucket" {
   provider                = aws.logging
@@ -53,7 +51,67 @@ resource "aws_kms_key" "log_bucket" {
           "kms:DescribeKey"
         ]
         Resource = "*"
-      }
+      },
+      {
+        Sid       = "AllowOrgFinopsKmsUse"
+        Effect    = "Allow"
+        Principal = { AWS = local.org_finops_user_arn }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid       = "AllowGlueCrawlerDecrypt"
+        Effect    = "Allow"
+        Principal = { AWS = local.glue_crawler_role_arn }
+        Action = [
+          "kms:Decrypt",
+          "kms:DescribeKey",
+          "kms:GenerateDataKey*"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid       = "AllowAthenaUseOfKey"
+        Effect    = "Allow"
+        Principal = { Service = "athena.amazonaws.com" }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.mgmt.account_id
+          }
+        }
+      },
+      {
+        Sid       = "AllowMgmtAccountUseKeyViaAthena"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:root" }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:ViaService"    = "athena.${var.aws_region}.amazonaws.com"
+            "kms:CallerAccount" = data.aws_caller_identity.mgmt.account_id
+          }
+        }
+      },
     ]
   })
 }
@@ -69,7 +127,6 @@ resource "aws_s3_bucket" "central_logs" {
   bucket   = var.central_log_bucket_name
 }
 
-# ✅ Key change: enforce destination bucket ownership so replication doesn't need ACL translation
 resource "aws_s3_bucket_ownership_controls" "central_logs" {
   provider = aws.logging
   bucket   = aws_s3_bucket.central_logs.id
@@ -135,7 +192,6 @@ resource "aws_s3_bucket_policy" "central_logs" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      # CloudTrail ACL check
       {
         Sid       = "AWSCloudTrailAclCheck"
         Effect    = "Allow"
@@ -151,7 +207,6 @@ resource "aws_s3_bucket_policy" "central_logs" {
           }
         }
       },
-      # CloudTrail write (mgmt)
       {
         Sid       = "AWSCloudTrailWriteMgmt"
         Effect    = "Allow"
@@ -168,7 +223,6 @@ resource "aws_s3_bucket_policy" "central_logs" {
           }
         }
       },
-      # CloudTrail write (org)
       {
         Sid       = "AWSCloudTrailWriteOrg"
         Effect    = "Allow"
@@ -185,7 +239,6 @@ resource "aws_s3_bucket_policy" "central_logs" {
           }
         }
       },
-      # Replication role can write replicas under cur prefix
       {
         Sid       = "AllowCURReplicationRoleWrite"
         Effect    = "Allow"
@@ -198,11 +251,10 @@ resource "aws_s3_bucket_policy" "central_logs" {
         ]
         Resource = "${aws_s3_bucket.central_logs.arn}/${var.cur_s3_prefix}/*"
       },
-      # Allow mgmt FinOps user to list/read ONLY the CUR prefix (for verification)
       {
         Sid       = "AllowOrgFinopsListCurPrefix"
         Effect    = "Allow"
-        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:user/org-finops" }
+        Principal = { AWS = local.org_finops_user_arn }
         Action    = "s3:ListBucket"
         Resource  = aws_s3_bucket.central_logs.arn
         Condition = {
@@ -217,22 +269,131 @@ resource "aws_s3_bucket_policy" "central_logs" {
       {
         Sid       = "AllowOrgFinopsReadCurObjects"
         Effect    = "Allow"
-        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:user/org-finops" }
+        Principal = { AWS = local.org_finops_user_arn }
         Action = [
           "s3:GetObject",
           "s3:GetObjectVersion"
         ]
         Resource = "${aws_s3_bucket.central_logs.arn}/${var.cur_s3_prefix}/*"
-      }
+      },
+      {
+        Sid       = "AllowOrgFinopsGetBucketLocation"
+        Effect    = "Allow"
+        Principal = { AWS = local.org_finops_user_arn }
+        Action    = "s3:GetBucketLocation"
+        Resource  = aws_s3_bucket.central_logs.arn
+      },
+      {
+        Sid       = "AllowOrgFinopsListAthenaResultsPrefix"
+        Effect    = "Allow"
+        Principal = { AWS = local.org_finops_user_arn }
+        Action    = "s3:ListBucket"
+        Resource  = aws_s3_bucket.central_logs.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = [
+              "athena-results/*",
+              "athena-results/"
+            ]
+          }
+        }
+      },
+      {
+        Sid       = "AllowOrgFinopsWriteAthenaResults"
+        Effect    = "Allow"
+        Principal = { AWS = local.org_finops_user_arn }
+        Action = [
+          "s3:PutObject",
+          "s3:AbortMultipartUpload"
+        ]
+        Resource = "${aws_s3_bucket.central_logs.arn}/athena-results/*"
+      },
+      {
+        Sid       = "AllowGlueCrawlerListCurPrefix"
+        Effect    = "Allow"
+        Principal = { AWS = local.glue_crawler_role_arn }
+        Action    = "s3:ListBucket"
+        Resource  = aws_s3_bucket.central_logs.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = [
+              "${var.cur_s3_prefix}/*",
+              "${var.cur_s3_prefix}/"
+            ]
+          }
+        }
+      },
+      {
+        Sid       = "AllowGlueCrawlerReadCurObjects"
+        Effect    = "Allow"
+        Principal = { AWS = local.glue_crawler_role_arn }
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion"
+        ]
+        Resource = "${aws_s3_bucket.central_logs.arn}/${var.cur_s3_prefix}/*"
+      },
+      {
+        Sid       = "AllowAthenaWriteResults"
+        Effect    = "Allow"
+        Principal = { Service = "athena.amazonaws.com" }
+        Action = [
+          "s3:PutObject",
+          "s3:AbortMultipartUpload"
+        ]
+        Resource = "${aws_s3_bucket.central_logs.arn}/athena-results/*"
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.mgmt.account_id
+          }
+        }
+      },
+      {
+        Sid       = "AllowAthenaListBucketForResults"
+        Effect    = "Allow"
+        Principal = { Service = "athena.amazonaws.com" }
+        Action    = "s3:GetBucketLocation"
+        Resource  = aws_s3_bucket.central_logs.arn
+      },
+      {
+        Sid       = "AllowMgmtAccountListAthenaResults"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:root" }
+        Action    = "s3:ListBucket"
+        Resource  = aws_s3_bucket.central_logs.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = [
+              "athena-results/*",
+              "athena-results/"
+            ]
+          }
+        }
+      },
+      {
+        Sid       = "AllowMgmtAccountReadWriteAthenaResults"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:root" }
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:PutObject",
+          "s3:AbortMultipartUpload"
+        ]
+        Resource = "${aws_s3_bucket.central_logs.arn}/athena-results/*"
+      },
+      {
+        Sid       = "AllowMgmtAccountGetBucketLocation"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.mgmt.account_id}:root" }
+        Action    = "s3:GetBucketLocation"
+        Resource  = aws_s3_bucket.central_logs.arn
+      },
     ]
   })
 
   depends_on = [aws_s3_bucket_ownership_controls.central_logs]
 }
-
-############################################
-# Org CloudTrail (Management Acct)
-############################################
 
 resource "aws_cloudtrail" "org_trail" {
   name                          = var.cloudtrail_trail_name
@@ -242,14 +403,8 @@ resource "aws_cloudtrail" "org_trail" {
   include_global_service_events = true
   enable_log_file_validation    = true
 
-  depends_on = [
-    aws_s3_bucket_policy.central_logs
-  ]
+  depends_on = [aws_s3_bucket_policy.central_logs]
 }
-
-############################################
-# GuardDuty org delegated admin (Security Acct)
-############################################
 
 resource "aws_guardduty_organization_admin_account" "admin" {
   admin_account_id = var.security_account_id
@@ -272,14 +427,8 @@ resource "aws_guardduty_organization_configuration" "org" {
 
   auto_enable_organization_members = "ALL"
 
-  depends_on = [
-    aws_guardduty_detector.security
-  ]
+  depends_on = [aws_guardduty_detector.security]
 }
-
-############################################
-# Security Hub org delegated admin (Security Acct)
-############################################
 
 resource "aws_securityhub_organization_admin_account" "admin" {
   admin_account_id = var.security_account_id

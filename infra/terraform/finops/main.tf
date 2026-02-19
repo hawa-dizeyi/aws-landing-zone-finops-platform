@@ -1,6 +1,52 @@
 data "aws_caller_identity" "current" {}
 
 ############################################
+# KMS for CUR delivery bucket (Payer/Mgmt)
+############################################
+
+resource "aws_kms_key" "cur_delivery" {
+  description             = "KMS key for CUR delivery bucket"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowPayerAccountAdmin"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid       = "AllowBillingReportsUseKey"
+        Effect    = "Allow"
+        Principal = { Service = "billingreports.amazonaws.com" }
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_kms_alias" "cur_delivery" {
+  name          = "alias/cur-delivery"
+  target_key_id = aws_kms_key.cur_delivery.key_id
+}
+
+############################################
 # CUR Delivery Bucket (Management/Payer Account)
 ############################################
 
@@ -38,7 +84,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "cur_delivery" {
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.cur_delivery.arn
     }
   }
 }
@@ -69,8 +116,9 @@ resource "aws_s3_bucket_policy" "cur_delivery" {
         Resource  = "${aws_s3_bucket.cur_delivery.arn}/*"
         Condition = {
           StringEquals = {
-            "aws:SourceArn"     = "arn:aws:cur:us-east-1:${data.aws_caller_identity.current.account_id}:definition/*"
-            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+            "aws:SourceArn"                   = "arn:aws:cur:us-east-1:${data.aws_caller_identity.current.account_id}:definition/*"
+            "aws:SourceAccount"               = data.aws_caller_identity.current.account_id
+            "s3:x-amz-server-side-encryption" = "aws:kms"
           }
         }
       }
@@ -122,6 +170,101 @@ resource "aws_athena_workgroup" "finops" {
       output_location = "s3://${var.central_log_bucket_name}/${var.athena_results_prefix}/"
     }
   }
+}
+
+############################################
+# Glue Crawler (CUR table)
+############################################
+
+data "aws_iam_policy_document" "glue_crawler_assume" {
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["glue.amazonaws.com"]
+    }
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "glue_crawler" {
+  name               = "glue-cur-crawler-role"
+  assume_role_policy = data.aws_iam_policy_document.glue_crawler_assume.json
+}
+
+data "aws_iam_policy_document" "glue_crawler_policy" {
+  statement {
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = ["arn:aws:s3:::${var.central_log_bucket_name}"]
+
+    condition {
+      test     = "StringLike"
+      variable = "s3:prefix"
+      values   = ["${var.cur_s3_prefix}/*", "${var.cur_s3_prefix}/"]
+    }
+  }
+
+  statement {
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:GetObjectVersion"]
+    resources = ["arn:aws:s3:::${var.central_log_bucket_name}/${var.cur_s3_prefix}/*"]
+  }
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "glue:GetDatabase", "glue:GetDatabases",
+      "glue:CreateTable", "glue:UpdateTable", "glue:GetTable", "glue:GetTables",
+      "glue:CreatePartition", "glue:BatchCreatePartition", "glue:UpdatePartition", "glue:GetPartition", "glue:GetPartitions"
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    effect    = "Allow"
+    actions   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    resources = ["*"]
+  }
+
+  statement {
+    effect    = "Allow"
+    actions   = ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey*"]
+    resources = [var.central_log_kms_key_arn]
+  }
+}
+
+resource "aws_iam_role_policy" "glue_crawler" {
+  role   = aws_iam_role.glue_crawler.id
+  policy = data.aws_iam_policy_document.glue_crawler_policy.json
+}
+
+resource "aws_glue_crawler" "cur" {
+  name          = var.cur_crawler_name
+  role          = aws_iam_role.glue_crawler.arn
+  database_name = aws_glue_catalog_database.cur.name
+  table_prefix  = var.cur_catalog_table_prefix
+  description   = "CUR parquet crawler"
+
+  s3_target {
+    path = "s3://${var.central_log_bucket_name}/${var.cur_s3_prefix}/"
+  }
+
+  schema_change_policy {
+    delete_behavior = "LOG"
+    update_behavior = "UPDATE_IN_DATABASE"
+  }
+
+  recrawl_policy {
+    recrawl_behavior = "CRAWL_EVERYTHING"
+  }
+
+  configuration = jsonencode({
+    Version = 1.0
+    CrawlerOutput = {
+      Partitions = { AddOrUpdateBehavior = "InheritFromTable" }
+    }
+  })
 }
 
 ############################################
