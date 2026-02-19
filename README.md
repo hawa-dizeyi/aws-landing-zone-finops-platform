@@ -1,50 +1,50 @@
 # Project 04 — AWS Multi-Account Landing Zone & FinOps Governance Platform
 
-This project implements a **production-style AWS multi-account landing zone** with built-in governance, centralized security baselines, and a FinOps-ready data plane.
+This repository implements a production-style **AWS multi-account landing zone** with governance guardrails, centralized security baselines, and a FinOps-ready data foundation.
 
-The goal is not just account provisioning, but establishing a **repeatable organizational foundation** that supports centralized audit visibility, cost transparency, and future automation (including ML-driven anomaly detection).
+The goal is not just account provisioning, but building a repeatable organization setup that supports **audit visibility, cost transparency, and automation** (including ML-driven anomaly detection later on).
 
-The platform is built and managed using Terraform, follows AWS delegated administrator patterns, and reflects how a real enterprise environment would be structured.
+Everything is managed with Terraform and follows AWS delegated administrator patterns to reflect how multi-account environments are commonly operated in practice.
 
 ---
 
 ## Project Scope & Intent
 
-This project focuses on three core outcomes:
+This project focuses on three outcomes:
 
 ### 1) Multi-account governance
-- Enforced organizational structure
-- Guardrails via SCPs
+- Enforced organization structure and OU layout
+- Guardrails through SCPs
 - Controlled account placement and lifecycle management
 
 ### 2) Organization-wide security & logging
-- Centralized, immutable audit logging
-- Org-level threat detection and security posture visibility
-- Delegated administrator model (security and logging accounts)
+- Centralized audit logging with retention controls
+- Org-wide threat detection and posture visibility
+- Delegated administrator model (security + logging accounts)
 
 ### 3) FinOps-ready data foundation
 - Payer-level Cost & Usage Reports (CUR)
 - Cross-account replication into the centralized logging account
-- Athena-ready structure for cost analytics and automation
+- Athena + Glue for cost analytics and automation
 
 ---
 
 ## Repository Structure (High Level)
 
 - `infra/terraform/org`  
-  AWS Organizations setup: OUs, SCP guardrails, and account vending logic.
+  AWS Organizations setup (OUs, SCP guardrails, account vending).
 
 - `infra/terraform/security`  
-  Organization-wide security baseline: centralized logging, CloudTrail, GuardDuty, and Security Hub using delegated administrators.
+  Security baseline (central logging, org CloudTrail, GuardDuty, Security Hub) using delegated administrators.
 
 - `infra/terraform/finops`  
-  Cost & Usage Reports (CUR), replication, Glue database, Athena workgroup, and FinOps data scaffolding.
+  CUR delivery, replication, Glue database, Athena workgroup, and FinOps data plane wiring.
 
 - `sql/athena/cur`  
-  Athena SQL scaffolding for CUR tables and cost analytics views.
+  Athena SQL scaffolding for analytics views (cost rollups, deltas, top movers).
 
 - `ml/`  
-  Future SageMaker pipelines for cost anomaly detection.
+  Future SageMaker pipelines for anomaly detection.
 
 - `apps/dashboard`  
   Optional lightweight frontend (Vercel) for visualizing cost and security insights.
@@ -55,17 +55,17 @@ This project focuses on three core outcomes:
 
 ### What was implemented
 - AWS Organization with ALL features enabled
-- Organizational Units (Security, Logging, Workloads, Sandbox)
-- Service Control Policies (SCPs) enforcing baseline guardrails
-- Account vending logic with quota-aware safeguards
-- Terraform-managed state for deterministic, repeatable builds
+- Organizational Units: Security, Logging, Workloads, Sandbox
+- Baseline SCP guardrails
+- Account vending logic (quota-aware)
+- Terraform-managed state for deterministic builds
 
 ### Design notes
-- Governance layers are fully code-driven.
-- SCPs prevent high-risk actions (leaving org, disabling audit logs, weakening guardrails).
+- Governance is fully code-driven.
+- SCPs prevent high-risk actions (leaving the org, weakening audit controls, disabling logging).
 - Account creation is optional to respect AWS account quota constraints.
 
-This phase establishes the **control plane** of the landing zone.
+This phase establishes the **control plane**.
 
 ---
 
@@ -73,16 +73,15 @@ This phase establishes the **control plane** of the landing zone.
 
 ### What was implemented
 - **Central logging account**
-  - Encrypted S3 bucket
-  - Lifecycle policies
-  - Customer-managed KMS key
-  - Public access fully blocked
+  - Encrypted S3 bucket (KMS)
+  - Lifecycle policies and retention controls
+  - Public access blocked
   - Ownership controls enforced
 
 - **Organization CloudTrail**
   - Multi-region
   - Log file validation enabled
-  - Writes centrally to logging account
+  - Writes centrally to the logging account
 
 - **GuardDuty**
   - Delegated administrator model
@@ -99,9 +98,9 @@ Validation is performed via:
 - AWS CLI checks
 - Terraform state inspection
 - Cross-account log delivery confirmation
-- Org-wide service auto-enrollment confirmation
+- Org-wide service enrollment confirmation
 
-This reflects how production security baselines are verified in practice.
+This mirrors how security baselines are typically validated in production environments.
 
 ---
 
@@ -110,38 +109,64 @@ This reflects how production security baselines are verified in practice.
 Phase 3 connects governance and security with financial visibility.
 
 ### What was implemented
-
 - **Cost & Usage Report (CUR)** at payer level
   - Parquet format
   - DAILY granularity
-  - Athena integration artifacts enabled
+  - Athena artifacts enabled
 
 - **Dedicated CUR delivery bucket**
   - Versioning enabled
   - Public access blocked
   - Ownership controls enforced
+  - SSE-KMS enforced to support replication filtering
 
 - **Cross-account replication**
-  - CUR objects replicated into central logging account under `cur/`
+  - CUR objects replicated into the central logging bucket under `cur/`
   - Replication role with least-privilege IAM policy
-  - Destination encrypted using central logging KMS key
-  - Modern replication schema (delete marker + KMS source selection criteria configured)
+  - Destination encrypted using the central logging KMS key
 
 - **Athena & Glue foundations**
-  - Glue database created
-  - Dedicated Athena workgroup for FinOps queries
-  - SQL scaffolding committed for analytics layer
+  - Glue database created (`cur_db`)
+  - Dedicated Athena workgroup (`finops`)
+  - Query results stored centrally under `athena-results/`
 
 ### Why this structure
+CUR lands in a dedicated delivery bucket for billing isolation.
 
-CUR lands in a dedicated bucket for clean billing isolation.
+Replication provides:
+- Central retention and access model
+- One authoritative audit + cost storage location
+- Clean separation between billing delivery and governance storage
 
-Replication ensures:
-- Centralized retention model
-- Single authoritative audit and cost storage location
-- Clean separation of billing delivery vs. governance storage
+---
 
-This mirrors real enterprise FinOps patterns.
+# Phase 3.2 — Analytics Layer (Athena + Glue) (Completed)
+
+Phase 3.2 turns raw CUR data into a queryable analytics layer.
+
+### What was implemented
+- Glue Catalog database: `cur_db`
+- CUR table cataloged as: `cur_org_cur`
+- Athena workgroup isolation: `finops`
+- Partition discovery and repairs for Parquet layout (`MSCK REPAIR TABLE`)
+- Baseline query patterns for:
+  - Daily spend (account/service/region)
+  - Day-over-day deltas and top movers
+  - Month-to-date rollups
+
+### Evidence (Phase 3.2)
+- Athena database + table:  
+  `docs/screenshots/phase-3-2/01-athena-curdb-table.png`
+- Athena query returning rows:  
+  `docs/screenshots/phase-3-2/02-athena-query-rows.png`
+- Partition repair execution:  
+  `docs/screenshots/phase-3-2/03-athena-msck-repair.png`
+- Glue database + table:  
+  `docs/screenshots/phase-3-2/04-glue-curdb-table.png`
+- Replicated Parquet objects in central bucket:  
+  `docs/screenshots/phase-3-2/05-s3-central-logs-cur-parquet.png`
+- Terraform apply output (FinOps):  
+  `docs/screenshots/phase-3-2/06-terraform-apply-finops.png`
 
 ---
 
@@ -168,23 +193,22 @@ terraform init
 terraform apply
 ```
 
+### Phase 3.2 — Analytics initialization (Athena)
+After CUR data lands and the Glue table exists:
+```
+MSCK REPAIR TABLE cur_db.cur_org_cur;
+```
 > Note  
 > Some resources (e.g., Security Hub) may require import if already enabled.  
 > This is intentional and reflects real-world environments rather than greenfield assumptions.
 
 ---
 
-# Next Steps (Phase 3.2+)
+# Next Steps
 
-- Create Athena external table from CUR Parquet artifacts
-- Build views for:
-  - Multi-account cost rollups
-  - Service-level spend
-  - Regional spend
-  - Daily deltas and cost spikes
-- Introduce automated cost alerting
-- Add SageMaker-based anomaly detection
-- Optional dashboard for executive visibility
+- Phase 4: Event-driven automation (CUR delivery → Athena refresh → alerting)
+- Cost spike detection logic + notifications (Slack/email)
+- Phase 5: SageMaker-based anomaly scoring over daily features
 
 ---
 
